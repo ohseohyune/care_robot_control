@@ -1,0 +1,11 @@
+# Python 캐시 파일
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ROS 관련 임시 파일
+build/
+install/
+log/
+.vscode/
+.DS_Store
