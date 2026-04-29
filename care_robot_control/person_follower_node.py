@@ -82,18 +82,26 @@ DEFAULT_PARAMS = {
 
     # Target following distance
     "target_distance":  1.0,       # [m]
-    "distance_tol":     0.10,      # [m]  deadband ±0.1 m (spec requirement)
+    "distance_tol":     0.05,      # [m]  tighter deadband for lower steady-state error
 
-    # PD gains — distance loop
-    "Kp_v":             1.5,       # [m/s per m error]
+    # PID gains — distance loop
+    # I term eliminates steady-state error when tracking a moving person
+    # (P-only: SS error = v_person / Kp_v ≈ 0.5m at 0.3 m/s)
+    "Kp_v":             1.2,       # [m/s per m error]
+    "Ki_v":             0.4,       # [m/s per m·s] — drives SS error → 0
     "Kd_v":             0.15,
+    "i_max_v":          0.5,       # [m/s] anti-windup: Ki*integral clamped to ±i_max_v
+    "distance_filter_alpha": 0.35, # LPF for noisy distance measurement (0<alpha<=1)
+    "deadband_integral_decay": 0.92,  # preserve some integral action near target
 
     # PD gains — heading loop
     "Kp_w":             1.2,       # [rad/s per rad error]
     "Kd_w":             0.05,
+    "heading_slowdown_angle": 0.70,   # [rad] start reducing forward speed for large yaw error
 
     # Velocity limits
-    "v_max":            0.8,       # [m/s]  conservative for indoor care robot
+    # Frail elderly walk at 0.4~0.6 m/s → robot needs to exceed that to catch up
+    "v_max":            0.6,       # [m/s]  slightly above elderly walking speed
     "omega_max":        1.0,       # [rad/s]
 
     # Neck yaw
@@ -103,13 +111,15 @@ DEFAULT_PARAMS = {
     # Camera FOV (ArduCam IMX708 wide, horizontal)
     "camera_fov_h":     2.094,     # [rad] ~120°
 
-    # State machine
-    "search_speed":     0.4,       # [rad/s] neck scan speed during SEARCHING
-    "search_timeout":   5.0,       # [s] → IDLE after this
+    # State machine — search pattern (body 120° rotate → neck ±60° scan, repeat)
+    # Target: complete 360° search before person walks out of 5m detection range
+    # At 0.5 m/s, person travels ~5m in 10s → keep total search time under ~20s
+    "search_speed":     0.8,       # [rad/s] neck scan: ±60° in ~2.6s
+    "search_omega":     0.6,       # [rad/s] body rotation: 120° in ~3.5s
 
     # Control loop
     "control_hz":       50.0,
-    "vision_timeout":   0.5,       # [s] no detection → SEARCHING
+    "vision_timeout":   0.3,       # [s] no detection → SEARCHING (react quickly)
 }
 
 
@@ -127,17 +137,22 @@ class PersonFollowerNode(Node):
         self.r_d       = p("target_distance")
         self.tol       = p("distance_tol")
         self.Kp_v      = p("Kp_v")
+        self.Ki_v      = p("Ki_v")
         self.Kd_v      = p("Kd_v")
+        self.i_max_v   = p("i_max_v")
+        self.dist_alpha = p("distance_filter_alpha")
+        self.deadband_i_decay = p("deadband_integral_decay")
         self.Kp_w      = p("Kp_w")
         self.Kd_w      = p("Kd_w")
+        self.heading_slow_angle = p("heading_slowdown_angle")
         self.v_max     = p("v_max")
         self.w_max     = p("omega_max")
         self.neck_lim  = p("neck_limit")
         self.neck_kret = p("neck_return_gain")
         self.fov_h     = p("camera_fov_h")
-        self.search_spd = p("search_speed")
-        self.search_to  = p("search_timeout")
-        self.vis_to     = p("vision_timeout")
+        self.search_spd   = p("search_speed")
+        self.search_omega = p("search_omega")
+        self.vis_to       = p("vision_timeout")
         dt_ctrl         = 1.0 / p("control_hz")
 
         # ── QoS ──────────────────────────────────────────────────────────
@@ -182,15 +197,25 @@ class PersonFollowerNode(Node):
         self.angle     = None   # latest from vision [rad], neck_yaw frame
         self.detected  = False
 
-        self.prev_e_r  = 0.0   # previous distance error (for derivative)
-        self.prev_phi  = 0.0   # previous angle error
-        self.neck_pos  = 0.0   # current neck yaw command [rad]
+        self.prev_e_r   = 0.0   # previous distance error (for derivative)
+        self.e_r_integ  = 0.0   # distance error integral (for I term)
+        self.prev_phi   = 0.0   # previous angle error
+        self.neck_pos   = 0.0   # current neck yaw command [rad]
+        self.distance_filt = None
 
         # FSM
-        self.state             = "IDLE"  # IDLE | FOLLOWING | SEARCHING
-        self.last_detect_time  = None
-        self.search_direction  = 1.0    # +1 or -1 for sweep direction
-        self.search_elapsed    = 0.0
+        self.state            = "IDLE"  # IDLE | FOLLOWING | SEARCHING
+        self.last_detect_time = None
+        self.last_known_angle = 0.0     # person's angle at last detection [rad]
+
+        # SEARCHING sub-state machine
+        #   Pattern: [body rotates 120°] → [neck scans ±60°]  ×2 segments = 1 loop
+        #   Repeat up to 2 loops (4 segments total) then IDLE
+        self.search_sub_state     = "BODY_ROTATING"  # "BODY_ROTATING" | "NECK_SCANNING"
+        self.search_segment_count = 0     # completed segments (each = rotate+scan)
+        self.search_body_rotated  = 0.0   # accumulated body rotation this segment [rad]
+        self.search_body_dir      = 1.0   # +1=CCW / -1=CW
+        self.neck_scan_dir        = 1.0   # neck sweep direction during NECK_SCANNING
 
         self.dt = dt_ctrl
 
@@ -207,20 +232,30 @@ class PersonFollowerNode(Node):
     # ─────────────────────────────────────────────
     def _detection_cb(self, msg: "PersonDetection"):
         self.distance = float(msg.distance)
+        self.distance_filt = self._filter_distance(self.distance)
         self.angle    = float(msg.angle)
         self.detected = bool(msg.detected)
         if self.detected:
-            self.last_detect_time = self.get_clock().now()
+            self.last_detect_time  = self.get_clock().now()
+            self.last_known_angle  = self.angle
 
     def _detection_raw_cb(self, msg):
         """Fallback for Float64MultiArray [distance, angle, detected]."""
         d = msg.data
         if len(d) >= 3:
             self.distance = float(d[0])
+            self.distance_filt = self._filter_distance(self.distance)
             self.angle    = float(d[1])
             self.detected = bool(d[2] > 0.5)
             if self.detected:
                 self.last_detect_time = self.get_clock().now()
+                self.last_known_angle = self.angle
+
+    def _filter_distance(self, distance: float) -> float:
+        if self.distance_filt is None:
+            return distance
+        alpha = max(1e-3, min(1.0, self.dist_alpha))
+        return alpha * distance + (1.0 - alpha) * self.distance_filt
 
     # ─────────────────────────────────────────────
     # FSM transition
@@ -229,24 +264,30 @@ class PersonFollowerNode(Node):
         now = self.get_clock().now()
 
         if self.detected:
-            self.state          = "FOLLOWING"
-            self.search_elapsed = 0.0
-        else:
-            if self.last_detect_time is None:
-                self.state = "IDLE"
-                return
+            if self.state != "FOLLOWING":
+                self.e_r_integ = 0.0   # stale integral from search phase → discard
+            self.state = "FOLLOWING"
+            return
 
-            elapsed = (now - self.last_detect_time).nanoseconds * 1e-9
+        if self.last_detect_time is None:
+            self.state = "IDLE"
+            return
 
-            if elapsed > self.vis_to and self.state == "FOLLOWING":
-                self.state = "SEARCHING"
-                self.get_logger().info("Person lost → SEARCHING")
+        elapsed = (now - self.last_detect_time).nanoseconds * 1e-9
 
-            if self.state == "SEARCHING":
-                self.search_elapsed += self.dt
-                if self.search_elapsed > self.search_to:
-                    self.state = "IDLE"
-                    self.get_logger().info("Search timeout → IDLE")
+        if elapsed > self.vis_to and self.state == "FOLLOWING":
+            self.state                = "SEARCHING"
+            self.search_sub_state     = "BODY_ROTATING"
+            self.search_segment_count = 0
+            self.search_body_rotated  = 0.0
+            self.neck_pos             = 0.0
+            self.neck_scan_dir        = 1.0
+            # rotate toward the direction person was last seen
+            self.search_body_dir = 1.0 if self.last_known_angle >= 0.0 else -1.0
+            self.get_logger().info(
+                f"Person lost → SEARCHING "
+                f"(body={'CCW' if self.search_body_dir > 0 else 'CW'})"
+            )
 
     # ─────────────────────────────────────────────
     # Main control loop (50 Hz)
@@ -274,20 +315,34 @@ class PersonFollowerNode(Node):
     # Control: FOLLOWING
     # ─────────────────────────────────────────────
     def _compute_following(self):
-        r   = self.distance
+        r   = self.distance_filt if self.distance_filt is not None else self.distance
         phi = self.angle
 
-        # ── Distance PD ──────────────────────────────────
+        # ── Distance PID ─────────────────────────────────
         e_r  = r - self.r_d
         de_r = (e_r - self.prev_e_r) / self.dt
         self.prev_e_r = e_r
 
-        # Deadband: within tolerance → no longitudinal motion
+        # Deadband: hold near the setpoint, but keep some integral memory so the
+        # robot does not fully "give up" when the person keeps moving slowly.
         if abs(e_r) < self.tol:
             v = 0.0
+            self.e_r_integ *= self.deadband_i_decay
         else:
-            v = self.Kp_v * e_r + self.Kd_v * de_r
+            # Integrate with anti-windup clamp
+            self.e_r_integ += e_r * self.dt
+            integ_limit = self.i_max_v / max(self.Ki_v, 1e-6)
+            self.e_r_integ = max(-integ_limit, min(integ_limit, self.e_r_integ))
+
+            v = (self.Kp_v * e_r
+                 + self.Ki_v * self.e_r_integ
+                 + self.Kd_v * de_r)
             v = max(-self.v_max, min(self.v_max, v))
+
+        # If the person is far off-center, prioritize turning before charging ahead.
+        slowdown = math.cos(min(abs(phi), self.heading_slow_angle))
+        slowdown = max(0.0, slowdown)
+        v *= slowdown
 
         # ── Heading PD ───────────────────────────────────
         # phi is defined in neck_yaw frame.
@@ -317,22 +372,59 @@ class PersonFollowerNode(Node):
     # ─────────────────────────────────────────────
     def _compute_searching(self):
         """
-        Oscillate neck ±FOV/2 to scan for person.
-        If neck hits limit, reverse direction.
-        Body stays still (v=0, omega=0).
+        Systematic 360° search in two phases per segment:
+
+          BODY_ROTATING : wheels spin 120° while neck returns to center.
+          NECK_SCANNING : neck sweeps +60° → -60° (covers 120° FOV).
+
+        Two segments = one loop (covers 360° together with the original FOV).
+        After 2 loops (4 segments total) without detection → IDLE.
         """
-        v     = 0.0
+        _BODY_TARGET  = 2.0 * math.pi / 3.0  # 120° per segment
+        _MAX_SEGMENTS = 4                      # 2 loops × 2 segments
+
+        v = 0.0
         omega = 0.0
 
-        # Sweep neck
-        self.neck_pos += self.search_direction * self.search_spd * self.dt
+        if self.search_sub_state == "BODY_ROTATING":
+            omega = self.search_body_dir * self.search_omega
+            self.search_body_rotated += self.search_omega * self.dt
 
-        if self.neck_pos >= self.neck_lim:
-            self.neck_pos     = self.neck_lim
-            self.search_direction = -1.0
-        elif self.neck_pos <= -self.neck_lim:
-            self.neck_pos     = -self.neck_lim
-            self.search_direction = 1.0
+            # Neck drifts back to center during body rotation
+            self.neck_pos *= max(0.0, 1.0 - 5.0 * self.dt)
+
+            if self.search_body_rotated >= _BODY_TARGET:
+                self.search_body_rotated = 0.0
+                self.neck_pos            = 0.0
+                self.neck_scan_dir       = 1.0   # start scan: center → +lim → -lim
+                self.search_sub_state    = "NECK_SCANNING"
+                self.get_logger().info(
+                    f"Body +120° done → neck scan "
+                    f"(seg {self.search_segment_count + 1}/{_MAX_SEGMENTS})"
+                )
+
+        else:  # NECK_SCANNING
+            self.neck_pos += self.neck_scan_dir * self.search_spd * self.dt
+
+            if self.neck_scan_dir > 0.0 and self.neck_pos >= self.neck_lim:
+                self.neck_pos      = self.neck_lim
+                self.neck_scan_dir = -1.0          # reverse: sweep toward -lim
+
+            elif self.neck_scan_dir < 0.0 and self.neck_pos <= -self.neck_lim:
+                # Reached -lim → this segment is complete
+                self.neck_pos = -self.neck_lim
+                self.search_segment_count += 1
+                self.get_logger().info(
+                    f"Neck scan done — {self.search_segment_count}/{_MAX_SEGMENTS} segments"
+                )
+
+                if self.search_segment_count >= _MAX_SEGMENTS:
+                    self.state    = "IDLE"
+                    self.neck_pos = 0.0
+                    self.get_logger().info("Search complete (2 loops) → IDLE")
+                else:
+                    self.search_body_rotated = 0.0
+                    self.search_sub_state    = "BODY_ROTATING"
 
         return v, omega, self.neck_pos
 

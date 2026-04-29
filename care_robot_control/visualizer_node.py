@@ -16,6 +16,7 @@ from collections import deque
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from std_msgs.msg import Float64MultiArray, Float64, String
 from geometry_msgs.msg import Twist
 
@@ -32,11 +33,25 @@ class VisualizerNode(Node):
     def __init__(self):
         super().__init__("visualizer_node")
 
-        self.create_subscription(Float64MultiArray, "/sim_robot_pose",  self._robot_cb,  10)
-        self.create_subscription(Float64MultiArray, "/sim_person_pose", self._person_cb, 10)
-        self.create_subscription(Float64MultiArray, "/person_detection_raw", self._detect_cb, 10)
-        self.create_subscription(Twist, "/cmd_vel", self._cmdvel_cb, 10)
-        self.create_subscription(String, "/robot_state", self._state_cb, 10)
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5,
+        )
+        reliable_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+        )
+
+        self.create_subscription(Float64MultiArray, "/sim_robot_pose",        self._robot_cb,      sensor_qos)
+        self.create_subscription(Float64MultiArray, "/sim_person_pose",       self._person_cb,     sensor_qos)
+        self.create_subscription(Float64MultiArray, "/person_detection_raw",  self._detect_cb,     sensor_qos)
+        self.create_subscription(Twist,             "/cmd_vel",               self._cmdvel_cb,     reliable_qos)
+        self.create_subscription(String,            "/robot_state",           self._state_cb,      reliable_qos)
+        self.create_subscription(Float64,           "/neck_yaw_state",        self._neck_state_cb, reliable_qos)
+
+        self._sim_robot_pose_received = False
 
         self.robot_x   = 0.0
         self.robot_y   = 0.0
@@ -67,6 +82,12 @@ class VisualizerNode(Node):
         self.robot_x  = d[0]; self.robot_y  = d[1]
         self.robot_th = d[2]; self.neck_yaw = d[3]
         self.robot_trail.append((d[0], d[1]))
+        self._sim_robot_pose_received = True
+
+    def _neck_state_cb(self, msg: Float64):
+        # 실제 HW 모드: /sim_robot_pose가 없을 때 실제 모터 피드백으로 neck_yaw 업데이트
+        if not self._sim_robot_pose_received:
+            self.neck_yaw = msg.data
 
     def _person_cb(self, msg):
         d = msg.data
@@ -79,7 +100,14 @@ class VisualizerNode(Node):
         self.angle    = d[1]
         self.detected = d[2] > 0.5
 
-        t = time.time() - self.t0   # wall clock 기준 시간
+        # 실제 HW 모드(/sim_person_pose 없음): 거리+각도로 사람 위치 계산
+        if not self._sim_robot_pose_received:
+            person_th = self.robot_th + self.angle
+            self.person_x = self.robot_x + self.distance * math.cos(person_th)
+            self.person_y = self.robot_y + self.distance * math.sin(person_th)
+            self.person_trail.append((self.person_x, self.person_y))
+
+        t = time.time() - self.t0
         self.t_hist.append(t)
         self.er_hist.append(self.distance - 1.0)
         self.v_hist.append(self.v_cmd)
@@ -126,14 +154,20 @@ def draw_robot(ax, rx, ry, rth, neck_yaw):
 
 
 def run_visualizer(vis: VisualizerNode):
-    fig = plt.figure(figsize=(14, 7))
+    fig = plt.figure(figsize=(17, 8))
     fig.patch.set_facecolor("#1a1a2e")
 
-    ax_map = fig.add_subplot(1, 2, 1)
-    gs = fig.add_gridspec(3, 2, left=0.55, right=0.97, hspace=0.55, top=0.93, bottom=0.08)
-    ax_er  = fig.add_subplot(gs[0, :])
-    ax_vel = fig.add_subplot(gs[1, :])
-    ax_ny  = fig.add_subplot(gs[2, :])
+    # 맵 60% : 그래프 40% 비율
+    gs_main = fig.add_gridspec(1, 2, width_ratios=[3, 2],
+                                left=0.04, right=0.97,
+                                top=0.93, bottom=0.08,
+                                wspace=0.3)
+    ax_map = fig.add_subplot(gs_main[0, 0])
+
+    gs_right = gs_main[0, 1].subgridspec(3, 1, hspace=0.55)
+    ax_er  = fig.add_subplot(gs_right[0])
+    ax_vel = fig.add_subplot(gs_right[1])
+    ax_ny  = fig.add_subplot(gs_right[2])
 
     for ax in [ax_map, ax_er, ax_vel, ax_ny]:
         ax.set_facecolor("#16213e")

@@ -1,220 +1,339 @@
 """
 neck_controller_node.py
 =======================
-Dynamixel XC330-T181-T position controller for neck yaw axis.
+Hardware-facing neck yaw controller for Dynamixel XC330-T181-T.
 
-Hardware interface
-------------------
-Protocol  : Dynamixel Protocol 2.0 (TTL Half-Duplex)
-Baud rate : 57600 (default; change to 1M for production)
-ID        : 1 (configurable via parameter)
-Mode      : Position Control Mode (joint mode, 0~360°)
+ROS interface
+-------------
+Subscribes:
+  /neck_yaw_target   std_msgs/Float64   desired neck yaw [rad]
 
-Position conversion
--------------------
-XC330 resolution: 4096 pulse/rev → 0.0879°/pulse = 0.001534 rad/pulse
-Zero position    : 2048 (= 180° in absolute encoder, mapped to 0° in our frame)
-Range            : ±60° = ±1.047 rad → [2048 - 682, 2048 + 682] = [1366, 2730]
+Publishes:
+  /neck_yaw_state    std_msgs/Float64   measured neck yaw [rad]
 
-This node subscribes to /neck_yaw_target [rad] and writes position to Dynamixel.
-It also publishes /neck_yaw_state [rad] (current position feedback).
-
-Dependencies
-------------
-pip install dynamixel-sdk
-
-Simulation mode
----------------
-If 'simulation_mode' parameter is true (default), skips hardware and just
-echoes target as state — for testing without physical motor.
+Features
+--------
+- Supports simulation passthrough mode for software-only testing
+- Uses Dynamixel Protocol 2.0 over U2D2
+- Converts ROS radians <-> Dynamixel position ticks
+- Applies configurable direction, center tick, and soft joint limits
+- Reads back present position at a fixed rate
+- Optionally ramps commands to avoid abrupt neck motion
 """
 
 import math
+from typing import Optional
+
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Float64
 
 
-# Dynamixel XC330 control table addresses (Protocol 2.0)
-ADDR_TORQUE_ENABLE      = 64
-ADDR_OPERATING_MODE     = 11
-ADDR_GOAL_POSITION      = 116
-ADDR_PRESENT_POSITION   = 132
-ADDR_PROFILE_VELOCITY   = 112   # [0.229 rpm/unit]
+ADDR_OPERATING_MODE = 11
+ADDR_TORQUE_ENABLE = 64
+ADDR_HARDWARE_ERROR_STATUS = 70
 ADDR_PROFILE_ACCELERATION = 108
+ADDR_PROFILE_VELOCITY = 112
+ADDR_GOAL_POSITION = 116
+ADDR_PRESENT_POSITION = 132
 
-# XC330 constants
-RESOLUTION         = 4096          # pulses per revolution
-CENTER_PULSE       = 2048          # pulse value for 0 rad (center)
-RAD_PER_PULSE      = 2 * math.pi / RESOLUTION   # ~0.001534 rad
-OPERATING_MODE_POS = 3             # Position Control Mode
+TORQUE_DISABLE = 0
+TORQUE_ENABLE = 1
+OPERATING_MODE_POSITION = 3
 
-# Velocity profile: limit to 30 RPM for smooth motion
-# Unit: 0.229 rpm → 30 rpm / 0.229 = ~131
-PROFILE_VELOCITY   = 131
-PROFILE_ACCEL      = 20            # arbitrary smooth ramp
-
-
-def rad_to_pulse(rad: float) -> int:
-    """Convert radians (±π) to XC330 absolute position pulse [0, 4095]."""
-    pulse = CENTER_PULSE + int(round(rad / RAD_PER_PULSE))
-    return max(0, min(4095, pulse))
-
-
-def pulse_to_rad(pulse: int) -> float:
-    """Convert XC330 absolute position pulse to radians."""
-    return (pulse - CENTER_PULSE) * RAD_PER_PULSE
+XC330_RESOLUTION = 4096
+DEFAULT_CENTER_TICK = 2048
+DEFAULT_PROTOCOL_VERSION = 2.0
+DEFAULT_PROFILE_ACCEL_RAW = 20
 
 
 class NeckControllerNode(Node):
     def __init__(self):
         super().__init__("neck_controller_node")
 
-        # ── Parameters ────────────────────────────────────────────────────
-        self.declare_parameter("simulation_mode", True)
-        self.declare_parameter("device_name", "/dev/ttyUSB0")
-        self.declare_parameter("baud_rate", 57600)
-        self.declare_parameter("dxl_id", 1)
-        self.declare_parameter("neck_limit", 1.047)   # [rad] ±60°
-        self.declare_parameter("publish_hz", 50.0)
+        self._declare_parameters()
 
-        self.sim_mode   = self.get_parameter("simulation_mode").value
-        self.device     = self.get_parameter("device_name").value
-        self.baud       = self.get_parameter("baud_rate").value
-        self.dxl_id     = self.get_parameter("dxl_id").value
-        self.neck_lim   = self.get_parameter("neck_limit").value
-        pub_hz          = self.get_parameter("publish_hz").value
+        self.simulation_mode = self.get_parameter("simulation_mode").value
+        self.device_name = self.get_parameter("device_name").value
+        self.baud_rate = int(self.get_parameter("baud_rate").value)
+        self.protocol_version = float(self.get_parameter("protocol_version").value)
+        self.dxl_id = int(self.get_parameter("dxl_id").value)
+        self.publish_hz = float(self.get_parameter("publish_hz").value)
+        self.neck_limit = float(self.get_parameter("neck_limit").value)
+        self.center_tick = int(self.get_parameter("center_tick").value)
+        self.reverse_direction = bool(self.get_parameter("reverse_direction").value)
+        self.profile_velocity_rpm = float(
+            self.get_parameter("profile_velocity_rpm").value
+        )
+        self.profile_acceleration_raw = int(
+            self.get_parameter("profile_acceleration_raw").value
+        )
+        self.command_timeout = float(self.get_parameter("command_timeout").value)
+        self.max_command_step = float(self.get_parameter("max_command_step").value)
+        self.park_on_shutdown = bool(self.get_parameter("park_on_shutdown").value)
+        self.shutdown_position = float(
+            self.get_parameter("shutdown_position").value
+        )
+        self.startup_read_retries = int(
+            self.get_parameter("startup_read_retries").value
+        )
 
-        # ── QoS ──────────────────────────────────────────────────────────
+        self.rad_per_tick = (2.0 * math.pi) / XC330_RESOLUTION
+
         reliable_qos = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
         )
 
-        # ── Publishers / Subscribers ──────────────────────────────────────
         self.sub_target = self.create_subscription(
             Float64, "/neck_yaw_target", self._target_cb, reliable_qos
         )
-        self.pub_state = self.create_publisher(
-            Float64, "/neck_yaw_state", reliable_qos
-        )
+        self.pub_state = self.create_publisher(Float64, "/neck_yaw_state", reliable_qos)
 
-        # ── Internal state ────────────────────────────────────────────────
-        self.target_rad   = 0.0
-        self.current_rad  = 0.0
+        self.target_rad = 0.0
+        self.commanded_rad = 0.0
+        self.current_rad = 0.0
+        self.last_target_time = None
+        self.last_feedback_tick: Optional[int] = None
+
         self.port_handler = None
         self.packet_handler = None
+        self.comm_success = None
+        self.hw_ready = False
+        self.hw_error_reported = False
 
-        # ── Hardware init ─────────────────────────────────────────────────
-        if not self.sim_mode:
-            self._init_dynamixel()
-        else:
+        if self.simulation_mode:
             self.get_logger().warn(
-                "NeckControllerNode: SIMULATION MODE — no hardware communication"
+                "Neck controller running in simulation_mode=True; hardware IO skipped."
             )
+        else:
+            self._init_dynamixel()
 
-        # ── Timer ─────────────────────────────────────────────────────────
-        self.timer = self.create_timer(1.0 / pub_hz, self._control_loop)
+        timer_period = 1.0 / max(self.publish_hz, 1.0)
+        self.timer = self.create_timer(timer_period, self._control_loop)
 
         self.get_logger().info(
-            f"NeckControllerNode ready | ID={self.dxl_id} | "
-            f"limit=±{math.degrees(self.neck_lim):.0f}° | sim={self.sim_mode}"
+            "NeckControllerNode ready | "
+            f"id={self.dxl_id} port={self.device_name} baud={self.baud_rate} "
+            f"sim={self.simulation_mode} limit=+-{math.degrees(self.neck_limit):.1f}deg"
         )
 
-    # ─────────────────────────────────────────────
-    # Hardware init
-    # ─────────────────────────────────────────────
+    def _declare_parameters(self):
+        self.declare_parameter("simulation_mode", True)
+        self.declare_parameter("device_name", "/dev/ttyUSB0")
+        self.declare_parameter("baud_rate", 57600)
+        self.declare_parameter("protocol_version", DEFAULT_PROTOCOL_VERSION)
+        self.declare_parameter("dxl_id", 1)
+        self.declare_parameter("publish_hz", 50.0)
+        self.declare_parameter("neck_limit", 1.047)
+        self.declare_parameter("center_tick", DEFAULT_CENTER_TICK)
+        self.declare_parameter("reverse_direction", False)
+        self.declare_parameter("profile_velocity_rpm", 30.0)
+        self.declare_parameter("profile_acceleration_raw", DEFAULT_PROFILE_ACCEL_RAW)
+        self.declare_parameter("command_timeout", 0.5)
+        self.declare_parameter("max_command_step", 0.08)
+        self.declare_parameter("park_on_shutdown", True)
+        self.declare_parameter("shutdown_position", 0.0)
+        self.declare_parameter("startup_read_retries", 5)
+
+    def _target_cb(self, msg: Float64):
+        self.target_rad = self._clamp_rad(float(msg.data))
+        self.last_target_time = self.get_clock().now()
+
+    def _control_loop(self):
+        if self.simulation_mode:
+            self.commanded_rad = self._slew_toward(self.commanded_rad, self.target_rad)
+            self.current_rad = self.commanded_rad
+            self._publish_state()
+            return
+
+        if not self.hw_ready:
+            if not self.hw_error_reported:
+                self.get_logger().error(
+                    "Dynamixel hardware is not ready. Check launch logs for the first "
+                    "port/baud/ID error and verify the motor power is on."
+                )
+                self.hw_error_reported = True
+            return
+
+        desired_rad = self._get_live_target()
+        self.commanded_rad = self._slew_toward(self.commanded_rad, desired_rad)
+
+        goal_tick = self._rad_to_tick(self.commanded_rad)
+        if self._write4(ADDR_GOAL_POSITION, goal_tick):
+            self.last_feedback_tick = goal_tick
+
+        present_tick = self._read_present_position()
+        if present_tick is not None:
+            self.current_rad = self._tick_to_rad(present_tick)
+
+        self._publish_state()
+
+    def _get_live_target(self) -> float:
+        if self.last_target_time is None or self.command_timeout <= 0.0:
+            return self.target_rad
+
+        age = (self.get_clock().now() - self.last_target_time).nanoseconds * 1e-9
+        if age <= self.command_timeout:
+            return self.target_rad
+
+        return 0.0
+
+    def _slew_toward(self, current: float, target: float) -> float:
+        max_step = max(self.max_command_step, 0.0)
+        if max_step <= 0.0:
+            return target
+        delta = max(-max_step, min(max_step, target - current))
+        return self._clamp_rad(current + delta)
+
+    def _clamp_rad(self, rad: float) -> float:
+        return max(-self.neck_limit, min(self.neck_limit, rad))
+
+    def _rad_to_tick(self, rad: float) -> int:
+        rad = self._clamp_rad(rad)
+        sign = -1 if self.reverse_direction else 1
+        tick = self.center_tick + int(round(sign * rad / self.rad_per_tick))
+        return max(0, min(XC330_RESOLUTION - 1, tick))
+
+    def _tick_to_rad(self, tick: int) -> float:
+        sign = -1 if self.reverse_direction else 1
+        rad = sign * (tick - self.center_tick) * self.rad_per_tick
+        return self._clamp_rad(rad)
+
+    def _publish_state(self):
+        msg = Float64()
+        msg.data = self.current_rad
+        self.pub_state.publish(msg)
+
     def _init_dynamixel(self):
         try:
-            from dynamixel_sdk import (
-                PortHandler, PacketHandler, COMM_SUCCESS
-            )
+            from dynamixel_sdk import COMM_SUCCESS, PacketHandler, PortHandler
         except ImportError:
             self.get_logger().error(
-                "dynamixel_sdk not installed. Run: pip install dynamixel-sdk"
+                "Missing dynamixel_sdk. Install it with `pip install dynamixel-sdk`."
             )
-            self.sim_mode = True
             return
 
-        from dynamixel_sdk import PortHandler, PacketHandler, COMM_SUCCESS
-
-        self.port_handler   = PortHandler(self.device)
-        self.packet_handler = PacketHandler(2.0)   # Protocol 2.0
+        self.comm_success = COMM_SUCCESS
+        self.port_handler = PortHandler(self.device_name)
+        self.packet_handler = PacketHandler(self.protocol_version)
 
         if not self.port_handler.openPort():
-            self.get_logger().error(f"Failed to open port {self.device}")
-            self.sim_mode = True
+            self.get_logger().error(f"Failed to open Dynamixel port {self.device_name}")
             return
 
-        if not self.port_handler.setBaudRate(self.baud):
-            self.get_logger().error("Failed to set baud rate")
-            self.sim_mode = True
+        if not self.port_handler.setBaudRate(self.baud_rate):
+            self.get_logger().error(
+                f"Failed to set baud rate {self.baud_rate} on {self.device_name}"
+            )
+            self.port_handler.closePort()
+            self.port_handler = None
             return
 
-        # Set operating mode to Position Control
-        self._write1(ADDR_TORQUE_ENABLE, 0)                   # torque off first
-        self._write1(ADDR_OPERATING_MODE, OPERATING_MODE_POS)
-        self._write4(ADDR_PROFILE_VELOCITY, PROFILE_VELOCITY)
-        self._write4(ADDR_PROFILE_ACCELERATION, PROFILE_ACCEL)
-        self._write1(ADDR_TORQUE_ENABLE, 1)                   # torque on
+        if not self._write1(ADDR_TORQUE_ENABLE, TORQUE_DISABLE):
+            return
+        if not self._write1(ADDR_OPERATING_MODE, OPERATING_MODE_POSITION):
+            return
 
+        velocity_raw = max(1, int(round(self.profile_velocity_rpm / 0.229)))
+        self._write4(ADDR_PROFILE_ACCELERATION, self.profile_acceleration_raw)
+        self._write4(ADDR_PROFILE_VELOCITY, velocity_raw)
+
+        if not self._write1(ADDR_TORQUE_ENABLE, TORQUE_ENABLE):
+            return
+
+        present_tick = None
+        for _ in range(max(1, self.startup_read_retries)):
+            present_tick = self._read_present_position(log_errors=False)
+            if present_tick is not None:
+                break
+
+        if present_tick is None:
+            self.get_logger().error(
+                "Could not read Present Position from the Dynamixel after startup."
+            )
+            return
+
+        self.last_feedback_tick = present_tick
+        self.current_rad = self._tick_to_rad(present_tick)
+        self.target_rad = self.current_rad
+        self.commanded_rad = self.current_rad
+        self.hw_ready = True
+
+        hw_error = self._read1(ADDR_HARDWARE_ERROR_STATUS, log_errors=False)
         self.get_logger().info(
-            f"Dynamixel XC330 (ID={self.dxl_id}) initialized on {self.device}"
+            "Dynamixel connected | "
+            f"id={self.dxl_id} port={self.device_name} baud={self.baud_rate} "
+            f"present={present_tick} rad={self.current_rad:.3f} hw_error={hw_error}"
         )
 
-    def _write1(self, addr, value):
-        self.packet_handler.write1ByteTxRx(
-            self.port_handler, self.dxl_id, addr, value
+    def _check_result(self, comm_result, dxl_error, action: str, log_errors: bool = True):
+        if comm_result != self.comm_success:
+            if log_errors:
+                reason = self.packet_handler.getTxRxResult(comm_result)
+                self.get_logger().error(f"{action} failed: {reason}")
+            return False
+
+        if dxl_error != 0:
+            if log_errors:
+                reason = self.packet_handler.getRxPacketError(dxl_error)
+                self.get_logger().error(f"{action} returned device error: {reason}")
+            return False
+
+        return True
+
+    def _write1(self, addr: int, value: int, log_errors: bool = True) -> bool:
+        if self.port_handler is None or self.packet_handler is None:
+            return False
+        comm_result, dxl_error = self.packet_handler.write1ByteTxRx(
+            self.port_handler, self.dxl_id, addr, int(value)
+        )
+        return self._check_result(
+            comm_result, dxl_error, f"write1 addr={addr} value={value}", log_errors
         )
 
-    def _write4(self, addr, value):
-        self.packet_handler.write4ByteTxRx(
-            self.port_handler, self.dxl_id, addr, value
+    def _write4(self, addr: int, value: int, log_errors: bool = True) -> bool:
+        if self.port_handler is None or self.packet_handler is None:
+            return False
+        comm_result, dxl_error = self.packet_handler.write4ByteTxRx(
+            self.port_handler, self.dxl_id, addr, int(value)
+        )
+        return self._check_result(
+            comm_result, dxl_error, f"write4 addr={addr} value={value}", log_errors
         )
 
-    def _read4(self, addr):
-        val, _, _ = self.packet_handler.read4ByteTxRx(
+    def _read1(self, addr: int, log_errors: bool = True) -> Optional[int]:
+        if self.port_handler is None or self.packet_handler is None:
+            return None
+        value, comm_result, dxl_error = self.packet_handler.read1ByteTxRx(
             self.port_handler, self.dxl_id, addr
         )
-        return val
+        if not self._check_result(
+            comm_result, dxl_error, f"read1 addr={addr}", log_errors
+        ):
+            return None
+        return int(value)
 
-    # ─────────────────────────────────────────────
-    # Callback
-    # ─────────────────────────────────────────────
-    def _target_cb(self, msg: Float64):
-        rad = float(msg.data)
-        self.target_rad = max(-self.neck_lim, min(self.neck_lim, rad))
+    def _read_present_position(self, log_errors: bool = True) -> Optional[int]:
+        if self.port_handler is None or self.packet_handler is None:
+            return None
+        value, comm_result, dxl_error = self.packet_handler.read4ByteTxRx(
+            self.port_handler, self.dxl_id, ADDR_PRESENT_POSITION
+        )
+        if not self._check_result(
+            comm_result, dxl_error, "read Present Position", log_errors
+        ):
+            return None
+        return int(value)
 
-    # ─────────────────────────────────────────────
-    # Control loop
-    # ─────────────────────────────────────────────
-    def _control_loop(self):
-        if self.sim_mode:
-            # In simulation, treat target as current (instant response)
-            self.current_rad = self.target_rad
-        else:
-            # Write goal position
-            goal_pulse = rad_to_pulse(self.target_rad)
-            self._write4(ADDR_GOAL_POSITION, goal_pulse)
-
-            # Read present position
-            present_pulse = self._read4(ADDR_PRESENT_POSITION)
-            self.current_rad = pulse_to_rad(present_pulse)
-
-        # Publish current state
-        state_msg = Float64()
-        state_msg.data = self.current_rad
-        self.pub_state.publish(state_msg)
-
-    # ─────────────────────────────────────────────
-    # Cleanup
-    # ─────────────────────────────────────────────
     def destroy_node(self):
-        if self.port_handler is not None:
-            # Disable torque before closing
-            self._write1(ADDR_TORQUE_ENABLE, 0)
+        if self.port_handler is not None and self.packet_handler is not None:
+            if self.park_on_shutdown and self.hw_ready:
+                park_tick = self._rad_to_tick(self.shutdown_position)
+                self._write4(ADDR_GOAL_POSITION, park_tick, log_errors=False)
+            self._write1(ADDR_TORQUE_ENABLE, TORQUE_DISABLE, log_errors=False)
             self.port_handler.closePort()
         super().destroy_node()
 
@@ -233,18 +352,3 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# NOTES
-# ─────────────────────────────────────────────────────────────────────────────
-# XC330 default ID is 1. Use Dynamixel Wizard to verify / change ID.
-#
-# For Jazzy, the official dynamixel_hardware package is available:
-#   https://github.com/ROBOTIS-GIT/dynamixel_hardware
-# This node is a minimal standalone alternative — if you use ros2_control,
-# replace this with the dynamixel_hardware plugin and a joint_trajectory_controller.
-#
-# Baud rate: default 57600. For 4 Mbps production use:
-#   self.port_handler.setBaudRate(4000000)
-#   and set EEPROM baud rate via Dynamixel Wizard.
-# ─────────────────────────────────────────────────────────────────────────────
