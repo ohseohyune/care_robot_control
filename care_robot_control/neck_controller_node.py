@@ -11,14 +11,6 @@ Subscribes:
 Publishes:
   /neck_yaw_state    std_msgs/Float64   measured neck yaw [rad]
 
-Features
---------
-- Supports simulation passthrough mode for software-only testing
-- Uses Dynamixel Protocol 2.0 over U2D2
-- Converts ROS radians <-> Dynamixel position ticks
-- Applies configurable direction, center tick, and soft joint limits
-- Reads back present position at a fixed rate
-- Optionally ramps commands to avoid abrupt neck motion
 """
 
 import math

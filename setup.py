@@ -26,11 +26,10 @@ setup(
         ],
     },
     entry_points={
-    'console_scripts': [
-        'person_follower = care_robot_control.person_follower_node:main',
-        'neck_controller = care_robot_control.neck_controller_node:main',
-        'robot_simulator = care_robot_control.robot_simulator_node:main',
-        'visualizer = care_robot_control.visualizer_node:main',
+        'console_scripts': [
+            'neck_controller = care_robot_control.neck_controller_node:main',
+            'ebimu = care_robot_control.ebimu_node:main',
+            'neck_swing_demo = care_robot_control.neck_swing_demo:main',
         ],
     },
 )
